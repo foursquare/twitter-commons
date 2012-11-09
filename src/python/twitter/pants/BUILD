@@ -46,6 +46,7 @@ python_library(
     pants("src/python/twitter/common/dirutil"),
     pants("src/python/twitter/common/lang"),
     pants("src/python/twitter/common/python"),
+    pants("src/python/twitter/common/java"),
     pants(":pants-deps"),
   ],
   sources = PANTS_SOURCES,
