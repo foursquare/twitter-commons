@@ -27,6 +27,7 @@ from xml.etree import ElementTree
 from twitter.common.collections import OrderedDict
 from twitter.common.contextutil import open_zip as open_jar, temporary_dir
 from twitter.common.dirutil import safe_mkdir, safe_open, safe_rmtree
+from twitter.common.java.class_file import ClassFile
 
 from twitter.pants import get_buildroot, is_scala, is_scalac_plugin
 from twitter.pants.base.target import Target
@@ -39,10 +40,8 @@ from twitter.pants.tasks.jvm_compiler_dependencies import Dependencies
 from twitter.pants.tasks.nailgun_task import NailgunTask
 from twitter.pants.tasks.jvm_classfile import JavaConstantPool
 
-
 # Well known metadata file required to register scalac plugins with nsc.
 _PLUGIN_INFO_FILE = 'scalac-plugin.xml'
-
 
 class ScalaCompile(NailgunTask):
   @staticmethod
@@ -600,10 +599,10 @@ class ScalaDependencyCache(object):
         # for each class file, get the set of referenced classes - these
         # are the classes that it depends on.
         for cf in class_files:
-          pool = JavaConstantPool(cf)
-          pool.parse()
-          dep_classes = [ "%s.class" % s for s in pool.getReferencedClasses() ]
-          source_file_deps = source_file_deps.union(dep_classes)
+          cf = ClassFile.from_file(cf, False)
+          dep_set = cf.get_external_class_references()
+          dep_classfiles = [ "%s.class" % s for s in dep_set ]
+          source_file_deps = source_file_deps.union(dep_classfiles)
 
         self.deps_by_source[source] = source_file_deps
         # add data from these classes to the target data in the map.
