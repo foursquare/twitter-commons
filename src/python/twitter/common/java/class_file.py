@@ -143,7 +143,6 @@ class ClassFile(object):
       decode_full: optimization flag. If True, the entire classfile is decoded.
          If false, then decoding stops once the constant pool has been decoded.
     """
-
     return ClassFile(fp.read(), decode_full)
 
   @staticmethod
