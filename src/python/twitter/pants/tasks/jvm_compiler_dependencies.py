@@ -109,3 +109,41 @@ class Dependencies(object):
         relsrc = os.path.relpath(sourcefile, target.target_base)
         classes_by_target_by_source[target][relsrc] = classfiles
     return classes_by_target_by_source
+
+  def getClassToTargetMap(self, targets):
+    """
+      Gets a map from class to a list of the targets that provides the class.
+      If the class is part of more than one target, then the value in
+      the map will be a list of targets.
+
+      (Note that the same class provided by multiple targets should be
+      an error, but this isn't the right place to signal that; instead, here,
+      we just want a consistent mapping describing the class/target relationship.)
+
+      Params:
+         targets - a list of targets that should be included in this map.
+      Returns: a map from class files to lists of targets which provide those
+         targets.
+    """
+    result = dict()
+    sources = set()
+    target_by_source = dict()
+    for target in targets:
+      for source in target.sources:
+        src = os.path.normpath(os.path.join(target.target_base, source))
+        target_by_source[src] = target
+        sources.add(src)
+    for sourcefile, classfiles in self.classes_by_source.items():
+      src = os.path.normpath(os.path.join(target.target_base, source))
+      target = target_by_source[src]
+      for clazz in classfiles:
+        if clazz in result:
+          targets = result[clazz]
+          targets.append(target)
+        else:
+          result[clazz] = [ target ]
+    return result
+
+
+
+

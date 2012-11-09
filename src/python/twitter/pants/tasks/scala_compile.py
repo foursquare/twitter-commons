@@ -27,6 +27,7 @@ from xml.etree import ElementTree
 from twitter.common.collections import OrderedDict
 from twitter.common.contextutil import open_zip as open_jar, temporary_dir
 from twitter.common.dirutil import safe_mkdir, safe_open, safe_rmtree
+from twitter.common.java.class_file import ClassFile
 
 from twitter.pants import get_buildroot, is_scala, is_scalac_plugin
 from twitter.pants.base.target import Target
@@ -38,10 +39,8 @@ from twitter.pants.tasks.binary_utils import nailgun_profile_classpath
 from twitter.pants.tasks.jvm_compiler_dependencies import Dependencies
 from twitter.pants.tasks.nailgun_task import NailgunTask
 
-
 # Well known metadata file required to register scalac plugins with nsc.
 _PLUGIN_INFO_FILE = 'scalac-plugin.xml'
-
 
 class ScalaCompile(NailgunTask):
   @staticmethod
@@ -71,6 +70,18 @@ class ScalaCompile(NailgunTask):
                             action="callback", callback=mkflag.set_bool,
                             help="[True] Enable color in logging.")
 
+    option_group.add_option(mkflag("check-missing-deps"), mkflag("check-missing-deps", negate=True),
+                            dest="scala_check_missing_deps",
+                            action="callback", callback=mkflag.set_bool,
+                            default=False,
+                            help="[%default] Check for undeclared dependencies in scala code")
+
+    option_group.add_option(mkflag("debug-check-all-deps"), mkflag("debug-check-all-deps", negate=True),
+                            dest="scala_check_all_deps",
+                            action="callback", callback=mkflag.set_bool,
+                            default=False,
+                            help="[%default] Check all dependencies in scala code (for debugging purposes)")
+
   def __init__(self, context, workdir=None):
     NailgunTask.__init__(self, context, workdir=context.config.get('scala-compile', 'nailgun_dir'))
 
@@ -78,6 +89,9 @@ class ScalaCompile(NailgunTask):
       context.options.scala_compile_partition_size_hint \
       if context.options.scala_compile_partition_size_hint != -1 else \
       context.config.getint('scala-compile', 'partition_size_hint')
+
+    self.check_missing_deps = context.options.scala_check_missing_deps
+    self.check_all_deps = context.options.scala_check_all_deps
 
     # We use the scala_compile_color flag if it is explicitly set on the command line.
     self._color = \
@@ -169,6 +183,25 @@ class ScalaCompile(NailgunTask):
           self.execute_single_compilation(vt, cp, upstream_analysis_caches)
           if not self.dry_run:
             vt.update()
+      if self.check_missing_deps:
+        deps_cache = ScalaDependencyCache(self, scala_targets)
+        target_deps = deps_cache.get_compilation_dependencies()
+        for target in target_deps:
+          deps = target_deps[target].copy()
+          target.walk(self, lambda target: self._dependencyWalkWork(deps, target))
+          if len(deps) > 0:
+            # for now, just print a message. Later, upgrade this to really generate
+            # an error.
+            for dep_target in deps:
+              print "Error: target %s has undeclared compilation dependency on %s," % (target.address,
+                                                                                       dep_target.address)
+              print "because source file %s depends on class %s" % deps_cache.get_dependency_blame(target,
+                                                                                                   dep_target)
+
+
+  def _dependencyWalkWork(self, deps, target):
+    if target in deps:
+      deps.remove(target)
 
   def create_output_paths(self, targets):
     compilation_id = Target.maybe_readable_identify(targets)
@@ -502,3 +535,119 @@ class ScalaCompile(NailgunTask):
       raise TaskError, 'Could not find requested plugins: %s' % list(unresolved_plugins)
     return plugins
 
+class ScalaDependencyCache(object):
+  def __init__(self, compile_task, targets):
+    self.task = compile_task
+    self.targets = targets
+    # Combined mappings for all targets from target to the set of classes it depends on.
+    self.deps_by_target = {}
+    # Combined mappings for all targets from class to target that provides it.
+    self.targets_by_class = {}
+    # per source file mappings from source file to a list of classes they depend on.
+    self.deps_by_source = {}
+    self.computed_deps = None
+
+
+  def get_compilation_dependencies(self):
+    """
+    Computes a map from the source files in a target to class files that the source file
+    depends on.
+
+    Parameters:
+      targets: a list of the targets from the current compile run whose
+         dependencies should be analyzed.
+    Returns: a target-to-target mapping from targets to targets that they depend on.
+       If this was already computed, return the already computed result.
+    """
+    if self.computed_deps is not None:
+      return self.computed_deps
+
+    for target in self.targets:
+      (outdir, depfile, cachedir) = ScalaCompile.create_output_paths(self.task, [ target ])
+      # Need to load the depfiles to get the classes defined by the source.
+      deps = Dependencies(outdir)
+      deps.load(depfile)
+      # get the forward mapping, from target to the classes generated by the target.
+      class_by_target_for_target = deps.findclasses([target])
+      # get the invert mapping for this target, from the classes to the targets that generate them.
+      target_by_class_for_target = deps.getClassToTargetMap([target])
+
+      # Merge the class_by_target dependencies for this target into the combined targets_by_class mappings.
+      for cl in target_by_class_for_target:
+        cltargets = target_by_class_for_target[cl]
+        if len(cltargets) > 1:
+          # should convert this to a more serious error.
+          print "Error: class %s is generated by multiple targets %s" % (cl, cltargets)
+        else:
+         if cl in self.targets_by_class:
+           # error in this case? Probably need to check if the result of this is more than
+           # one target?
+           self.targets_by_class[cl] = self.targets_by_class[cl].union(cltargets)
+         else:
+           self.targets_by_class[cl] = set(cltargets)
+
+      # For each source in the current target, parse the class files that were generated from that source,
+      # to get the set of classes that they actually depend on.
+      for source in target.sources:
+        source_file_deps = set()
+        classes_in_source = class_by_target_for_target[target][source]
+        class_files = [os.path.join(outdir, cls) for cls in classes_in_source]
+        # for each class file, get the set of referenced classes - these
+        # are the classes that it depends on.
+        for cf in class_files:
+          cf = ClassFile.from_file(cf, False)
+          dep_set = cf.get_external_class_references()
+          dep_classfiles = [ "%s.class" % s for s in dep_set ]
+          source_file_deps = source_file_deps.union(dep_classfiles)
+
+        self.deps_by_source[source] = source_file_deps
+        # add data from these classes to the target data in the map.
+        if target in self.deps_by_target:
+          self.deps_by_target[target] = self.deps_by_target[target].union(source_file_deps)
+        else:
+          self.deps_by_target[target] = source_file_deps
+
+    # Now, we have a map from target to the classes they depend on,
+    # and a map from classes to the targets that provide them.
+    # combining the two, we can get a map from target to targets that it really depends on.
+
+    self.computed_deps = {}
+    for target in self.deps_by_target:
+      target_dep_classes = self.deps_by_target[target]
+      for cl in target_dep_classes:
+        if cl not in self.targets_by_class:
+          # We should probably provide a parameter for this filter here, to
+          # allow users to specify packages which shouldn't be flagged
+          # any class which isn't in any
+          # target, but which is in something clearly library-based, like "scala."
+          # shouldn't even generate a warning.
+          FILTER_PREFIXES = [ "scala", "java" ]
+          if self.task.check_all_deps and not reduce(lambda x, y: x or y,
+                [ cl.startswith(pre) for pre in FILTER_PREFIXES]):
+            print "Warning: Target %s depends on class %s which is not a compiler output" % (target, cl)
+          continue
+        target_dep_targets = self.targets_by_class[cl]
+        if target in self.computed_deps:
+          self.computed_deps[target] = self.computed_deps[target].union(target_dep_targets)
+        else:
+          self.computed_deps[target] = set(target_dep_targets)
+    return self.computed_deps
+    
+
+  def get_dependency_blame(self, from_target, to_target):
+    """
+    Figures out why target "from" depends on target "to".
+     Target "A" depends on "B" because "A"s class "X" depends on "Y" which is in "B"s source file "Z".
+     Returns: a pair of (source1, class) where:
+       source1 is the name of a source file in "from" that depends on something
+          in "to".
+       class is the name of the class that source1 depends on.
+    """
+    # iterate over the sources in the from target.
+    for source in from_target.sources:
+      # for each class that the source depends on:
+      for cl in self.deps_by_source[source]:
+        # if that's in the target, then call it the culprit.
+        if cl in self.targets_by_class and to_target in self.targets_by_class[cl]:
+          return (source, cl)
+    return ("none", "none")
