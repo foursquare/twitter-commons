@@ -116,7 +116,7 @@ class JarDependency(object):
     return not self.__eq__(other)
 
   def __repr__(self):
-    return "%s-%s-%s" % (self.org, self.name, self.rev)
+    return "JarDependency(%s-%s-%s)" % (self.org, self.name, self.rev)
 
   def resolve(self):
     yield self
