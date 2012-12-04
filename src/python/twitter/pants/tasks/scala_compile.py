@@ -78,6 +78,16 @@ class ScalaCompile(NailgunTask):
                             default=False,
                             help="[%default] Check for undeclared dependencies in scala code")
 
+    option_group.add_option(mkflag("intransitive-deps"),
+                            type="choice",
+                            action='store',
+                            dest='scala_intransitive_deps',
+                            choices=['none', 'warn', 'error'],
+                            default='none',
+                            help="[%default] Enable errors for undeclared deps that don't cause compilation" \
+                                  "errors, because the dependencies are provided transitively.")
+
+
 
   def __init__(self, context, workdir=None):
     NailgunTask.__init__(self, context, workdir=context.config.get('scala-compile', 'nailgun_dir'))
@@ -88,6 +98,7 @@ class ScalaCompile(NailgunTask):
       context.config.getint('scala-compile', 'partition_size_hint')
 
     self.check_missing_deps = context.options.scala_check_missing_deps
+    self.intransitive = context.options.scala_intransitive_deps
     if self.check_missing_deps:
       JvmDependencyCache.init_product_requirements(self)
 
@@ -186,25 +197,42 @@ class ScalaCompile(NailgunTask):
         (deps_by_target, jar_deps_by_target) = deps_cache.get_compilation_dependencies()
         found_missing_deps = False
         for target in deps_by_target:
-          deps = deps_by_target[target].copy()
-          jar_deps = jar_deps_by_target[target].copy()
-          target.walk(lambda target: self._dependency_walk_work(deps, jar_deps, target))
-          if len(deps) > 0:
+          computed_deps = deps_by_target[target]
+          computed_jar_deps = jar_deps_by_target[target]
+
+          undeclared_deps = computed_deps.copy()
+          undeclared_jar_deps = computed_jar_deps.copy()
+          target.walk(lambda target: self._dependency_walk_work(undeclared_deps, undeclared_jar_deps, target))
+
+          immediate_missing_deps = computed_deps.difference(target.dependencies).difference([target])
+
+          if len(undeclared_deps) > 0:
             # for now, just print a message. Later, upgrade this to really generate
             # an error.
             found_missing_deps = True
             genmap = self.context.products.get('missing_deps')
-            genmap.add(target, self.context._buildroot, [x.derived_from.address.reference() for x in deps])
-            for dep_target in deps:
+            genmap.add(target, self.context._buildroot, [x.derived_from.address.reference() for x in undeclared_deps])
+            for dep_target in undeclared_deps:
               print ("Error: target %s has undeclared compilation dependency on %s," %
                      (target.address, dep_target.derived_from.address.reference()))
               print ("       because source file %s depends on class %s" %
                      deps_cache.get_dependency_blame(target, dep_target))
+              immediate_missing_deps.discard(dep_target)
           #if len(jar_deps) > 0:
           #  found_missing_deps = True
           #  for jd in jar_deps:
           #    print ("Error: target %s needs to depend on jar_dependency %s.%s" %
           #          (target.address, jd.org, jd.name))
+          if self.intransitive != "none":            
+            if len(immediate_missing_deps) > 0:
+              genmap = self.context.products.get('missing_deps')
+              if self.intransitive == "error":
+                found_missing_deps = True
+                genmap.add(target, self.context._buildroot,
+                           [x.derived_from.address.reference() for x in immediate_missing_deps])
+              for missing in immediate_missing_deps:
+                print ("Error: target %s depends on %s which is only declared transitively" % (target, missing))
+
         if found_missing_deps:
           raise TaskError('Missing dependencies detected.')
 
