@@ -78,10 +78,11 @@ class ScalaCompile(NailgunTask):
                             default=False,
                             help="[%default] Check for undeclared dependencies in scala code")
 
-    option_group.add_option(mkflag("intransitive-deps"),
+    # This flag should eventually be removed once code is in compliance.
+    option_group.add_option(mkflag("check-missing-intransitive-deps"),
                             type="choice",
                             action='store',
-                            dest='scala_intransitive_deps',
+                            dest='scala_check_intransitive_deps',
                             choices=['none', 'warn', 'error'],
                             default='none',
                             help="[%default] Enable errors for undeclared deps that don't cause compilation" \
@@ -98,7 +99,7 @@ class ScalaCompile(NailgunTask):
       context.config.getint('scala-compile', 'partition_size_hint')
 
     self.check_missing_deps = context.options.scala_check_missing_deps
-    self.intransitive = context.options.scala_intransitive_deps
+    self.check_intransitive_deps = context.options.scala_check_intransitive_deps
     if self.check_missing_deps:
       JvmDependencyCache.init_product_requirements(self)
 
@@ -223,10 +224,10 @@ class ScalaCompile(NailgunTask):
           #  for jd in jar_deps:
           #    print ("Error: target %s needs to depend on jar_dependency %s.%s" %
           #          (target.address, jd.org, jd.name))
-          if self.intransitive != "none":            
+          if self.check_intransitive_deps != "none":
             if len(immediate_missing_deps) > 0:
               genmap = self.context.products.get('missing_deps')
-              if self.intransitive == "error":
+              if self.check_intransitive_deps == "error":
                 found_missing_deps = True
                 genmap.add(target, self.context._buildroot,
                            [x.derived_from.address.reference() for x in immediate_missing_deps])
