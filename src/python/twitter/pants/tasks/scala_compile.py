@@ -87,8 +87,12 @@ class ScalaCompile(NailgunTask):
                             default='none',
                             help="[%default] Enable errors for undeclared deps that don't cause compilation" \
                                   "errors, because the dependencies are provided transitively.")
-
-
+    option_group.add_option(mkflag("check-unnecessary-deps"),
+                            mkflag("check-unnecessary-deps", negate=True),
+                            dest='scala_check_unnecessary_deps',
+                            action="callback", callback=mkflag.set_bool,
+                            default=False,
+                            help="[%default] Enable warnings for declared dependencies that are not needed.")
 
   def __init__(self, context, workdir=None):
     NailgunTask.__init__(self, context, workdir=context.config.get('scala-compile', 'nailgun_dir'))
@@ -100,6 +104,7 @@ class ScalaCompile(NailgunTask):
 
     self.check_missing_deps = context.options.scala_check_missing_deps
     self.check_intransitive_deps = context.options.scala_check_intransitive_deps
+    self.check_unnecessary_deps = context.options.scala_check_unnecessary_deps
     if self.check_missing_deps:
       JvmDependencyCache.init_product_requirements(self)
 
@@ -204,12 +209,8 @@ class ScalaCompile(NailgunTask):
           undeclared_deps = computed_deps.copy()
           undeclared_jar_deps = computed_jar_deps.copy()
           target.walk(lambda target: self._dependency_walk_work(undeclared_deps, undeclared_jar_deps, target))
-
           immediate_missing_deps = computed_deps.difference(target.dependencies).difference([target])
-
           if len(undeclared_deps) > 0:
-            # for now, just print a message. Later, upgrade this to really generate
-            # an error.
             found_missing_deps = True
             genmap = self.context.products.get('missing_deps')
             genmap.add(target, self.context._buildroot, [x.derived_from.address.reference() for x in undeclared_deps])
@@ -233,6 +234,11 @@ class ScalaCompile(NailgunTask):
                            [x.derived_from.address.reference() for x in immediate_missing_deps])
               for missing in immediate_missing_deps:
                 print ("Error: target %s depends on %s which is only declared transitively" % (target, missing))
+          if self.check_unnecessary_deps:
+            overdeps = (target.declared_dependencies).difference(computed_deps)
+            if len(overdeps) > 0:
+              for d in overdeps:
+                print ("Warning: target %s declares un-needed dependency on: %s" % (target, d))
 
         if found_missing_deps:
           raise TaskError('Missing dependencies detected.')
