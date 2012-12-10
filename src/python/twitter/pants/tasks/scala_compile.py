@@ -71,28 +71,8 @@ class ScalaCompile(NailgunTask):
                             dest="scala_compile_color",
                             action="callback", callback=mkflag.set_bool,
                             help="[True] Enable color in logging.")
+    JvmDependencyCache.setup_parser(option_group, args, mkflag)
 
-    option_group.add_option(mkflag("check-missing-deps"), mkflag("check-missing-deps", negate=True),
-                            dest="scala_check_missing_deps",
-                            action="callback", callback=mkflag.set_bool,
-                            default=False,
-                            help="[%default] Check for undeclared dependencies in scala code")
-
-    # This flag should eventually be removed once code is in compliance.
-    option_group.add_option(mkflag("check-missing-intransitive-deps"),
-                            type="choice",
-                            action='store',
-                            dest='scala_check_intransitive_deps',
-                            choices=['none', 'warn', 'error'],
-                            default='none',
-                            help="[%default] Enable errors for undeclared deps that don't cause compilation" \
-                                  "errors, because the dependencies are provided transitively.")
-    option_group.add_option(mkflag("check-unnecessary-deps"),
-                            mkflag("check-unnecessary-deps", negate=True),
-                            dest='scala_check_unnecessary_deps',
-                            action="callback", callback=mkflag.set_bool,
-                            default=False,
-                            help="[%default] Enable warnings for declared dependencies that are not needed.")
 
   def __init__(self, context, workdir=None):
     NailgunTask.__init__(self, context, workdir=context.config.get('scala-compile', 'nailgun_dir'))
@@ -198,59 +178,8 @@ class ScalaCompile(NailgunTask):
           self.execute_single_compilation(vt, cp, upstream_analysis_caches)
           if not self.dry_run:
             vt.update()
-      if self.check_missing_deps:
-        deps_cache = JvmDependencyCache(self, scala_targets)
-        (deps_by_target, jar_deps_by_target) = deps_cache.get_compilation_dependencies()
-        found_missing_deps = False
-        for target in deps_by_target:
-          computed_deps = deps_by_target[target]
-          computed_jar_deps = jar_deps_by_target[target]
-
-          undeclared_deps = computed_deps.copy()
-          undeclared_jar_deps = computed_jar_deps.copy()
-          target.walk(lambda target: self._dependency_walk_work(undeclared_deps, undeclared_jar_deps, target))
-          immediate_missing_deps = computed_deps.difference(target.dependencies).difference([target])
-          if len(undeclared_deps) > 0:
-            found_missing_deps = True
-            genmap = self.context.products.get('missing_deps')
-            genmap.add(target, self.context._buildroot, [x.derived_from.address.reference() for x in undeclared_deps])
-            for dep_target in undeclared_deps:
-              print ("Error: target %s has undeclared compilation dependency on %s," %
-                     (target.address, dep_target.derived_from.address.reference()))
-              print ("       because source file %s depends on class %s" %
-                     deps_cache.get_dependency_blame(target, dep_target))
-              immediate_missing_deps.discard(dep_target)
-          #if len(jar_deps) > 0:
-          #  found_missing_deps = True
-          #  for jd in jar_deps:
-          #    print ("Error: target %s needs to depend on jar_dependency %s.%s" %
-          #          (target.address, jd.org, jd.name))
-          if self.check_intransitive_deps != "none":
-            if len(immediate_missing_deps) > 0:
-              genmap = self.context.products.get('missing_deps')
-              if self.check_intransitive_deps == "error":
-                found_missing_deps = True
-                genmap.add(target, self.context._buildroot,
-                           [x.derived_from.address.reference() for x in immediate_missing_deps])
-              for missing in immediate_missing_deps:
-                print ("Error: target %s depends on %s which is only declared transitively" % (target, missing))
-          if self.check_unnecessary_deps:
-            overdeps = (target.declared_dependencies).difference(computed_deps)
-            if len(overdeps) > 0:
-              for d in overdeps:
-                print ("Warning: target %s declares un-needed dependency on: %s" % (target, d))
-
-        if found_missing_deps:
-          raise TaskError('Missing dependencies detected.')
-
-
-  def _dependency_walk_work(self, deps, jar_deps, target):
-    if target in deps:
-      deps.remove(target)
-    if isinstance(target, JvmTarget):
-      for jar_dep in target.dependencies:
-        if jar_dep in jar_deps:
-          jar_deps.remove(jar_dep)
+      deps_cache = JvmDependencyCache(self, scala_targets)
+      deps_cache.check_undeclared_dependencies()
 
   def create_output_paths(self, targets):
     compilation_id = Target.maybe_readable_identify(targets)
