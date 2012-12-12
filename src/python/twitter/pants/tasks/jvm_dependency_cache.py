@@ -64,8 +64,6 @@ class JvmDependencyCache(object):
     Set up command-line options for dependency checking.
     Any jvm compilation task that wants to use dependency analysis can call this from
     its setup_parser method to add the appropriate options for dependency testing.
-
-    See scala_compile.py for an example.
     """
     option_group.add_option(mkflag("check-missing-deps"), mkflag("check-missing-deps", negate=True),
                             dest="scala_check_missing_deps",
@@ -181,7 +179,10 @@ class JvmDependencyCache(object):
       found_jar_deps = found_jar_deps.union(jars)
     jardeps_by_id = {}
     for jardep in found_jar_deps:
-      jardeps_by_id[(jardep.org, jardep.name)] = jardep
+      if jardep.org != "internal":
+        jardeps_by_id[(jardep.org, jardep.name)] = jardep
+    
+    required_jars = jardeps_by_id.values()
 
     # Get the jar products. This is, unfortunately, a mess.
     # Assumes that the jar_dependency products are in the compile task.
@@ -195,9 +196,15 @@ class JvmDependencyCache(object):
     #   (target, conf), confdir -> file
     #   (org, name, conf), confdir -> file
     for target_key, product in jar_products.itermappings():
+      tstr = target_key.__repr__()
+      if tstr.find("openid") != -1:
+          print "!!!! TARGET_KEY = %s, products = %s" % (target_key, product)
+
+
       if isinstance(target_key, tuple):
         if target_key in jardeps_by_id:
           target = jardeps_by_id[target_key]
+          required_jars.remove(target)
           jars_for_target = set([])
           for dir in jar_products.by_target[target_key]:
             for j in jar_products.by_target[target_key][dir]:
@@ -209,6 +216,8 @@ class JvmDependencyCache(object):
         for f in jarfile.filelist:
           if f.filename.endswith(".class"):
             self.jar_targets_by_class[f.filename].add(target)
+    if len(required_jars) > 0:
+      print "!!!!! No jars for %s" % required_jars
 
   def _compute_source_deps(self):
     """
@@ -316,6 +325,8 @@ class JvmDependencyCache(object):
     generating warnings/error messages and (depending on flag settings),
     setting build products for the detected errors.
     """
+    if not self.check_missing_deps:
+      return
     (deps_by_target, jar_deps_by_target) = self.get_compilation_dependencies()
     found_missing_deps = False
     for target in deps_by_target:
