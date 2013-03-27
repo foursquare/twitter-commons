@@ -43,7 +43,7 @@ class Context(object):
     def info(self, msg): pass
     def warn(self, msg): pass
 
-  def __init__(self, config, options, target_roots, requested_goals, lock=Lock.unlocked(), log=None, timer=None):
+  def __init__(self, config, options, target_roots, requested_goals=[], lock=Lock.unlocked(), log=None, timer=None):
     self._config = config
     self._options = options
     self._lock = lock
