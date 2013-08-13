@@ -359,7 +359,7 @@ class NailgunProcessManager(object):
     pid = pids[0]
 
     # Expected output of the lsof cmd: pPID\nn[::127.0.0.1]:PORT
-    lines = NailgunProcessManager._run_cmd('lsof -a -p %s -i TCP -s TCP:LISTEN -Fn' % pid)
+    lines = NailgunProcessManager._run_cmd('lsof -a -p %s -i TCP -s TCP:LISTEN -P -Fn' % pid)
     if lines is None or len(lines) != 2 or lines[0] != 'p%s' % pid:
       return None
     port = lines[1][lines[1].rfind(':') + 1:].strip()
