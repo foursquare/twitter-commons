@@ -1,7 +1,9 @@
-import multiprocessing
 import os
+import platform
+import Queue
 import shutil
 import subprocess
+import threading
 import time
 from twitter.common.dirutil import safe_mkdir_for, safe_mkdir, safe_rmtree
 
@@ -17,23 +19,26 @@ class Snapshotter(object):
   Beyond the simple mkdir/rmtree, an example dir_manager might mount and unmount ramdisks.
   """
 
-  def __init__(self, output, src_root, paths, dir_manager):
+  def __init__(self, output, root, paths, dir_manager):
     """
       `output` specifies where to create snapshots
-      `src_root` specifies the path under which `paths` exist
-      `paths` is a list of relative paths (to src_root) that should be snapshotted
+      `root` specifies the path under which `paths` exist
+      `paths` is a list of relative paths (to root) that should be snapshotted
       `dir_manager` is an instance of a SnapshotManager
     """
     self.output = os.path.realpath(os.path.abspath(output))
-    self.src_root = os.path.realpath(os.path.abspath(src_root))
+    self.root = os.path.realpath(os.path.abspath(root))
     if not isinstance(paths, list):
       paths = [paths]
     self.paths = paths
+    if not isinstance(dir_manager, SnapshotManager):
+      raise TypeError("dir manager is not a SnapshotManager?")
     self.dir_manager = dir_manager
+    self.dir_manager.set_output_path(self.output)
 
   def _populate(self, snapshot):
     for path in self.paths:
-      src = os.path.join(self.src_root, path)
+      src = os.path.join(self.root, path)
       dest = os.path.join(snapshot, path)
       safe_mkdir_for(dest)
       shutil.copytree(src, dest)
@@ -65,12 +70,15 @@ class SnapshotManager(object):
     raise NotImplementedError
 
 class SimpleSnapshotManager(SnapshotManager):
-  def __init__(self, output_path):
-    self.output = output_path
+  def __init__(self):
     self.num = 0
 
+  def set_output_path(self, output_path):
+    self.output = output_path
+
   def cleanup(self):
-    pass
+    for snapshot in os.listdir(self.output):
+      safe_rmtree(snapshot)
 
   def create(self):
     snapshot = os.path.join(self.output, self.name())
@@ -90,13 +98,16 @@ class OsxRamDiskManager(SnapshotManager):
   """An OSX-specific ramdisk-based SnapshotManager, wrapping another SnapshotManager
     Useful when deleting snapshots becomes too expensive because HFS+ sucks.
 
-    mounts path returned by other manager's create on a new ramdisk of `size` megabytes and
+    mounts path returned by other manager's create on a new ramdisk of `size` bytes and
     unmounts it during destroy before calling other manager's destroy
   """
   def __init__(self, other_manger, size):
     self.other_manger = other_manger
     self.size = size
     self.mounts = {}
+
+  def set_output_path(self, output_path):
+    self.other_manger.set_output_path(output_path)
 
   def create(self):
     path = self.other_manger.create()
@@ -114,8 +125,7 @@ class OsxRamDiskManager(SnapshotManager):
     self.other_manger.cleanup()
 
   def new_device(self):
-    mb = self.size
-    sectors = (1024 * 1024 * mb) / 512
+    sectors = self.size / 512
     return _check_output(['hdid', '-nomount', 'ram://%d' % sectors]).strip()
 
   def mount(self, device, mount_point):
@@ -128,21 +138,183 @@ class OsxRamDiskManager(SnapshotManager):
     if device != None:
       _check_output(['umount', path])
       _check_output(['hdiutil', 'detach', device])
+      del self.mounts[path]
 
-class SimpleOnDemandSnapshotter(Snapshotter):
+  @classmethod
+  def get_size(clazz, root, paths):
+    def du(path):
+      return int(_check_output(['du', '-ks', path]).split()[0]) * 1024
+    return sum([du(os.path.join(root, path)) for path in paths])
+
+class OnDemandSnapshotter(Snapshotter):
   """A snapshot provider that makes copies on demand, when get() is called"""
-  def __init__(self, output, src_root, paths):
-    super(Snapshotter, self).__init__(output, src_root, paths, SimpleSnapshotManager(output))
-
   def get(self):
     snapshot = self.dir_manager.create()
     self._populate(snapshot)
     return snapshot
 
-class OnDemandRamdiskSnapshotter(SimpleOnDemandSnapshotter):
-  def __init__(self, output, src_root, paths, size):
-    manager = OsxRamDiskManager(SimpleSnapshotManager(output), size)
-    super(SimpleOnDemandSnapshotter, self).__init__(output, src_root, paths, manager)
+class WatchingSnapshotter(Snapshotter):
+  """A snapshot provider which keeps a snapshot ready by watching for changes"""
+  def __init__(self, output, root, paths, dir_manager, watcher):
+    super(WatchingSnapshotter, self).__init__(output, root, paths, dir_manager)
+    self.watcher = watcher
+    self.on_deck = Queue.Queue(1)
+    self.running = threading.Event()
+    self.taken = threading.Event()
+    self.changed = threading.Event()
+    self.producer = threading.Thread(target=self.producer_loop, name="producer")
+    self.updater = threading.Thread(target=self.updater_loop, name="updater")
+    self.producer.daemon = True
+    self.updater.daemon = True
+
+  def get(self):
+    path = self.on_deck.get()
+    self.taken.set()
+    return path
+
+  def start(self):
+    self.running.set()
+    self.taken.set()
+    self.producer.start()
+    self.updater.start()
+    self.watcher.start(self.handle_change)
+    super(WatchingSnapshotter, self).start()
+
+  def producer_loop(self):
+    while self.running.is_set():
+      if self.taken.is_set():
+        self.taken.clear()
+        snapshot = self.dir_manager.create()
+        self._populate(snapshot)
+        try:
+          self.on_deck.put(snapshot, True)
+        except Queue.Full:
+          self.dir_manager.destroy(snapshot)
+      else:
+        self.taken.wait(60)
+
+  def updater_loop(self):
+    while self.running.is_set():
+      if self.changed.is_set():
+        self.changed.clear()
+        try:
+          path = self.on_deck.get(False)
+          if self.resync(path):
+            try:
+              self.on_deck.put(path, False)
+            except Queue.Full:
+              self.dir_manager.destroy(path)
+          else:
+            self.taken.set()
+            self.dir_manager.destroy(path)
+        except Queue.Empty:
+          pass
+      else:
+        self.changed.wait(60)
+
+  def handle_change(self, path):
+    self.changed.set()
+
+  def stop(self):
+    self.running.clear()
+    self.taken.set()
+    self.changed.set()
+    self.empty()
+
+    super(WatchingSnapshotter, self).stop()
+
+  def empty(self):
+    while True:
+      try:
+        path = self.on_deck.get(False)
+        self.dir_manager.destroy(path)
+      except Queue.Empty:
+        break
+
+  def resync(self, snapshot):
+    for path in self.paths:
+      src = os.path.join(self.root, path) + os.sep # trailing slash means dest exists
+      dest = os.path.join(snapshot, path) # if we didn't add trailing slash to src, we'd dirname this
+      _check_output(['rsync', '-rtu', '--delete', src, dest])
+    return True
+
+class Watcher(object):
+  def __init__(self, paths):
+    self.paths = paths
+
+  def start(self, callback):
+    raise NotImplementedError
+
+class FsEventsWatcher(Watcher):
+  def start(self, callback):
+    from fsevents import Observer, Stream
+    observer = Observer()
+    observer.daemon = True
+    observer.start()
+    stream = Stream(lambda x: callback(x.name), *self.paths, file_events=True)
+    observer.schedule(stream)
+
+#TODO(davidt): test this on a linux host
+class InotifyWatcher(Watcher):
+  def start(self, callback):
+    import pyinotify
+    class OnWriteHandler(pyinotify.ProcessEvent):
+      def __init__(self, callback):
+        self.callback = callback
+      def process_IN_CREATE(self, event):
+        self.callback(event.pathname)
+      def process_IN_DELETE(self, event):
+        self.callback(event.pathname)
+      def process_IN_MODIFY(self, event):
+        self.callback(event.pathname)
+    wm = pyinotify.WatchManager()
+    handler = OnWriteHandler(callback)
+    notifier = pyinotify.ThreadedNotifier(wm, default_proc_fun=handler)
+    for path in self.paths:
+      wm.add_watch(path, pyinotify.ALL_EVENTS, rec=True, auto_add=True)
+    notifier.setDaemon(True)
+    notifier.start()
+
+def get_snapshotter(output_path, root, paths,
+  force_no_ramdisk=False,
+  force_no_watch=False,
+  size_override=None,
+  ideal_ramdisk_size=1.5):
+  """get a new snapshotter using file-watching if possible (unless force_no_watch is passed).
+  will automatically use ramdisks on osx unless force_no_ramdisk is passed.
+  if using ramdisks and size_override is not set, calls du to get size of
+  paths when starting and multiplies by ideal_ramdisk_size.
+  """
+
+  manager = SimpleSnapshotManager()
+
+  mac = platform.system() == 'Darwin'
+
+  if mac and not force_no_ramdisk: # use ramdisks to avoid hfs+ delete perf on osx
+    if size_override is not None:
+      initial_size = size_override
+    else:
+      initial_size = int(OsxRamDiskManager.get_size(root, paths) * ideal_ramdisk_size)
+    manager = OsxRamDiskManager(manager, initial_size)
+
+  if not force_no_watch:
+    roots = [os.path.join(root, path) for path in paths]
+    watcher = None
+    if mac:
+      try:
+        import fsevents
+        watcher = FsEventsWatcher(roots)
+      except ImportError:
+        pass # TODO(davidt): warn about falling back to on-demand
+    else:
+      try:
+        import pyinotify
+        watcher = InotifyWatcher(paths)
+      except ImportError:
+        pass # TODO(davidt): warn about falling back to on-demand
+    if watcher is not None:
+      return WatchingSnapshotter(output_path, root, paths, manager, watcher)
+  return Snapshotter(output_path, root, paths, manager)
 
 ## subprocess.check_output doesn't exist in Python 2.6, so I copied this
 ## backport from https://gist.github.com/1027906
