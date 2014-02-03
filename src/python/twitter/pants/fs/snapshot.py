@@ -314,7 +314,7 @@ def get_snapshotter(output_path, root, paths,
         pass # TODO(davidt): warn about falling back to on-demand
     if watcher is not None:
       return WatchingSnapshotter(output_path, root, paths, manager, watcher)
-  return Snapshotter(output_path, root, paths, manager)
+  return OnDemandSnapshotter(output_path, root, paths, manager)
 
 ## subprocess.check_output doesn't exist in Python 2.6, so I copied this
 ## backport from https://gist.github.com/1027906
